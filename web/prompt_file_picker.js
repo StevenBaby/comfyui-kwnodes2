@@ -1,0 +1,439 @@
+import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
+
+// Prompt File Picker (kwnodes2) frontend:
+// - directory field uses a VHS-style search dialog: click it, a dialog opens
+//   listing subdirectories of the typed path (one level, prefix filtered).
+//   Click a dir to descend, Enter/OK to commit.
+// - file dropdown refreshes when the directory changes.
+// - an inline editor shows the file content; Save writes back; New creates a
+//   fresh prompt_<n>.md; Refresh re-scans the directory.
+// Routes are /kwnodes2/* so this coexists with comfyui-kwnodes.
+
+const NODE_TYPE = "PromptFilePicker";
+
+function pathStem(value) {
+  const v = String(value || "");
+  const i = v.lastIndexOf("/");
+  if (i < 0) return ["", v];
+  return [v.slice(0, i + 1), v.slice(i + 1)];
+}
+
+function pathSearchBox(event, pos, node) {
+  const pathWidget = this;
+  if (pathWidget.prompt) return;
+  pathWidget.prompt = true;
+
+  let dialog = document.createElement("div");
+  dialog.className = "litegraph litesearchbox graphdialog rounded";
+  dialog.innerHTML =
+    '<span class="name">Directory</span> <input autofocus type="text" class="value">' +
+    '<button class="rounded">OK</button><div class="helper"></div>';
+  dialog.close = () => {
+    dialog.remove();
+    pathWidget.prompt = false;
+  };
+  document.body.append(dialog);
+
+  const input = dialog.querySelector(".value");
+  const optionsEl = dialog.querySelector(".helper");
+  input.value = pathWidget.value;
+
+  let timeout = null;
+  let lastPath = null;
+  let options = [];
+
+  const commit = () => {
+    pathWidget.value = input.value;
+    pathWidget.callback?.(pathWidget.value);
+    dialog.close();
+    node.graph?.setDirtyCanvas?.(true);
+  };
+
+  const updateOptions = async () => {
+    timeout = null;
+    const [path, remainder] = pathStem(input.value);
+    if (lastPath !== path) {
+      try {
+        const url = api.apiURL(
+          "/kwnodes2/getpath_image?" + new URLSearchParams({ path }),
+        );
+        const resp = await fetch(url);
+        options = (await resp.json()) || [];
+        options.sort();
+      } catch (_) {
+        options = [];
+      }
+      lastPath = path;
+    }
+    optionsEl.innerHTML = "";
+    for (const option of options) {
+      const name = option.endsWith("/") ? option.slice(0, -1) : option;
+      if (!name.startsWith(remainder)) continue;
+      const el = document.createElement("div");
+      el.innerText = option;
+      el.className = "litegraph lite-search-item is-dir";
+      el.addEventListener("click", () => {
+        input.value = path + option;
+        if (timeout) clearTimeout(timeout);
+        timeout = setTimeout(updateOptions, 10);
+      });
+      optionsEl.appendChild(el);
+    }
+  };
+
+  input.addEventListener("keydown", (e) => {
+    if (e.keyCode === 27) {
+      dialog.close();
+    } else if (e.keyCode === 13 && e.target.localName !== "textarea") {
+      commit();
+    } else if (e.keyCode === 9) {
+      const first = optionsEl.firstChild;
+      if (first) {
+        const [path] = pathStem(input.value);
+        input.value = path + first.innerText;
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    } else {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(updateOptions, 10);
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+  });
+
+  dialog.querySelector("button").addEventListener("click", commit);
+
+  const rect = app.canvas?.canvas?.getBoundingClientRect?.();
+  if (rect) {
+    dialog.style.left = (event?.clientX || 0) - rect.left - 20 + "px";
+    dialog.style.top = (event?.clientY || 0) - rect.top - 20 + "px";
+  }
+  setTimeout(() => {
+    input.focus();
+    updateOptions();
+  }, 10);
+}
+
+app.registerExtension({
+  name: "kwnodes2.PromptFilePicker",
+
+  // Write back dirty editors when the workflow is saved or queued.
+  setup() {
+    const originalGraphToPrompt = app.graphToPrompt?.bind(app);
+    if (originalGraphToPrompt) {
+      app.graphToPrompt = async function (...args) {
+        const result = await originalGraphToPrompt(...args);
+        const nodes = app.graph?._nodes || [];
+        for (const n of nodes) {
+          if (n.type === NODE_TYPE && n._writeBackBound) {
+            try {
+              await n._writeBackBound();
+            } catch (_) {
+              /* ignore */
+            }
+          }
+        }
+        return result;
+      };
+    }
+  },
+
+  async getCustomWidgets() {
+    return {
+      KWNODES2_PATH(node, inputName, inputData) {
+        const w = {
+          name: inputName,
+          type: "KWNODES2_PATH",
+          value: "",
+          options: inputData?.[1] || {},
+          draw(ctx, node, widgetWidth, y, H) {
+            const scale = app.canvas.ds.scale;
+            const showText = scale >= (app.canvas.low_quality_zoom_threshold ?? 0.5);
+            const margin = 15;
+            ctx.textAlign = "left";
+            ctx.fillStyle = LiteGraph.WIDGET_BGCOLOR;
+            ctx.strokeStyle = LiteGraph.WIDGET_OUTLINE_COLOR;
+            ctx.beginPath();
+            if (showText)
+              ctx.roundRect(margin, y, widgetWidth - margin * 2, H, [H * 0.5]);
+            else ctx.rect(margin, y, widgetWidth - margin * 2, H);
+            ctx.fill();
+            if (showText) {
+              if (!this.disabled) ctx.stroke();
+              ctx.save();
+              ctx.beginPath();
+              ctx.rect(margin, y, widgetWidth - margin * 2, H);
+              ctx.clip();
+              const label = this.label || this.name;
+              if (label != null) {
+                ctx.fillStyle = LiteGraph.WIDGET_SECONDARY_TEXT_COLOR;
+                ctx.fillText(label, margin * 2, y + H * 0.7);
+              }
+              ctx.fillStyle = this.value ? LiteGraph.WIDGET_TEXT_COLOR : "#777";
+              ctx.textAlign = "right";
+              ctx.fillText(
+                String(this.value || this.options.placeholder || ""),
+                widgetWidth - margin * 2,
+                y + H * 0.7,
+              );
+              ctx.restore();
+            }
+          },
+          mouse: pathSearchBox,
+        };
+        if (w.options.default != null) w.value = w.options.default;
+        node.widgets = node.widgets || [];
+        node.widgets.push(w);
+        return w;
+      },
+    };
+  },
+
+  beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeType.comfyClass !== NODE_TYPE) return;
+
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = onNodeCreated?.apply(this, arguments);
+
+      const dirWidget = this.widgets?.find((w) => w.name === "directory");
+      if (dirWidget) {
+        const idx = this.widgets.indexOf(dirWidget);
+        const defaultVal = dirWidget.value;
+        const placeholder = dirWidget.options?.placeholder;
+        this.widgets.splice(idx, 1);
+        const custom = app.widgets.KWNODES2_PATH(this, "directory", [
+          "STRING",
+          { default: defaultVal, placeholder },
+        ]);
+        this.widgets.splice(this.widgets.length - 1, 1);
+        this.widgets.splice(idx, 0, custom);
+        custom.callback = (value) => this._refreshFiles(value);
+      }
+
+      this._setupEditor();
+
+      const fileW = this.widgets?.find((w) => w.name === "file");
+      if (fileW) {
+        const node = this;
+        const origCb = fileW.callback;
+        fileW.callback = function (value) {
+          origCb?.call(this, value);
+          node._loadContent();
+        };
+      }
+
+      const subW = this.widgets?.find((w) => w.name === "sub");
+      if (subW) {
+        subW.label = "include sub directory";
+        const origSubCb = subW.callback;
+        subW.callback = function (value) {
+          origSubCb?.call(this, value);
+          const dirW = this.widgets?.find((w) => w.name === "directory");
+          if (dirW) this._refreshFiles(dirW.value);
+        };
+      }
+
+      const onRemoved = this.onRemoved;
+      this.onRemoved = function () {
+        onRemoved?.apply(this, arguments);
+        this._fileWatchCleanup?.();
+      };
+
+      const dirW0 = this.widgets?.find((w) => w.name === "directory");
+      if (dirW0) {
+        setTimeout(() => this._refreshFiles(dirW0.value), 0);
+      }
+
+      return r;
+    };
+
+    nodeType.prototype._setupEditor = function () {
+      const node = this;
+      const editorWidget = this.widgets?.find((w) => w.name === "editor");
+      if (!editorWidget) return;
+
+      const onExecuted = this.onExecuted;
+      this.onExecuted = function (msg) {
+        onExecuted?.apply(this, arguments);
+        const text = msg?.text?.[0];
+        if (text != null) {
+          editorWidget.value = text;
+        }
+      };
+
+      const refreshBtn = this.addWidget(
+        "button",
+        "refresh",
+        "↻ Refresh",
+        () => {
+          const dirW = node.widgets?.find((w) => w.name === "directory");
+          if (dirW) node._refreshFiles(dirW.value);
+          const reloadWidget = node.widgets?.find((w) => w.name === "reload");
+          if (reloadWidget) {
+            reloadWidget.value = (reloadWidget.value ?? 0) + 1;
+            reloadWidget.callback?.(reloadWidget.value);
+          }
+        },
+        { serialize: false },
+      );
+      refreshBtn.label = "↻ Refresh";
+
+      const saveBtn = this.addWidget(
+        "button",
+        "save",
+        "💾 Save",
+        async () => {
+          const dirW = node.widgets?.find((w) => w.name === "directory");
+          const fileW = node.widgets?.find((w) => w.name === "file");
+          const modeW = node.widgets?.find((w) => w.name === "mode");
+          if (!dirW || !fileW || fileW.value === "(no prompt files)") return;
+          const body = new URLSearchParams({
+            directory: dirW.value,
+            file: fileW.value,
+            mode: modeW?.value ?? "fenced",
+            content: editorWidget.value,
+          });
+          try {
+            await api.fetchApi("/kwnodes2/save_prompt_file", {
+              method: "POST",
+              body,
+            });
+          } catch (_) {
+            /* ignore */
+          }
+        },
+        { serialize: false },
+      );
+      saveBtn.label = "💾 Save";
+
+      const newBtn = this.addWidget(
+        "button",
+        "new",
+        "➕ New",
+        async () => {
+          const dirW = node.widgets?.find((w) => w.name === "directory");
+          if (!dirW) return;
+          try {
+            const resp = await api.fetchApi("/kwnodes2/new_prompt_file", {
+              method: "POST",
+              body: new URLSearchParams({ directory: dirW.value }),
+            });
+            const data = await resp.json();
+            if (data && data.ok && data.file) {
+              const fileW = node.widgets?.find((w) => w.name === "file");
+              if (fileW) fileW.value = data.file;
+              await node._refreshFiles(dirW.value);
+              const fw = node.widgets?.find((w) => w.name === "file");
+              if (fw) fw.value = data.file;
+              if (editorWidget) editorWidget.value = "";
+              node._loadContent?.();
+            }
+          } catch (_) {
+            /* ignore */
+          }
+        },
+        { serialize: false },
+      );
+      newBtn.label = "➕ New";
+
+      const btns = [refreshBtn, newBtn, saveBtn];
+      node.widgets = node.widgets.filter((w) => !btns.includes(w));
+      const insertAt = node.widgets.indexOf(editorWidget);
+      if (insertAt >= 0) {
+        node.widgets.splice(insertAt, 0, ...btns);
+      } else {
+        node.widgets.push(...btns);
+      }
+
+      node._writeBack = async () => {
+        const dirW = node.widgets?.find((w) => w.name === "directory");
+        const fileW = node.widgets?.find((w) => w.name === "file");
+        const modeW = node.widgets?.find((w) => w.name === "mode");
+        if (!dirW || !fileW || fileW.value === "(no prompt files)") return;
+        if (!editorWidget.value) return;
+        try {
+          await api.fetchApi("/kwnodes2/save_prompt_file", {
+            method: "POST",
+            body: new URLSearchParams({
+              directory: dirW.value,
+              file: fileW.value,
+              mode: modeW?.value ?? "fenced",
+              content: editorWidget.value,
+            }),
+          });
+        } catch (_) {
+          /* ignore */
+        }
+      };
+      node._writeBackBound = node._writeBack.bind(node);
+
+      node._loadContent = async function () {
+        const dirW = this.widgets?.find((w) => w.name === "directory");
+        const fileW = this.widgets?.find((w) => w.name === "file");
+        const modeW = this.widgets?.find((w) => w.name === "mode");
+        const editorW = this.widgets?.find((w) => w.name === "editor");
+        if (!dirW || !fileW || !fileW.value || fileW.value === "(no prompt files)") {
+          return;
+        }
+        const mode = modeW?.value ?? "fenced";
+        try {
+          const url = api.apiURL(
+            "/kwnodes2/read_prompt_file?" +
+            new URLSearchParams({
+              directory: dirW.value,
+              file: fileW.value,
+              mode,
+            }),
+          );
+          const resp = await fetch(url);
+          const data = await resp.json();
+          if (data && data.content != null && editorW) {
+            editorW.value = data.content;
+          }
+        } catch (_) {
+          /* ignore */
+        }
+      };
+
+      let lastFile = null;
+      node._fileWatch = setInterval(() => {
+        const fileW = node.widgets?.find((w) => w.name === "file");
+        const cur = fileW?.value ?? null;
+        if (cur !== lastFile) {
+          lastFile = cur;
+          node._loadContent();
+        }
+      }, 300);
+      node._fileWatchCleanup = () => clearInterval(node._fileWatch);
+    };
+
+    nodeType.prototype._refreshFiles = async function (directory) {
+      const fileWidget = this.widgets?.find((w) => w.name === "file");
+      if (!fileWidget || !directory) return;
+      const subW = this.widgets?.find((w) => w.name === "sub");
+      const sub = subW?.value ? 1 : 0;
+      try {
+        const url = api.apiURL(
+          "/kwnodes2/list_prompt_files?" +
+          new URLSearchParams({ directory, sub }),
+        );
+        const resp = await fetch(url);
+        const data = await resp.json();
+        if (data.files && data.files.length) {
+          fileWidget.options.values = data.files;
+          if (!data.files.includes(fileWidget.value)) {
+            fileWidget.value = data.files[0];
+          }
+          this.setDirtyCanvas?.(true, true);
+        }
+      } catch (_) {
+        /* ignore */
+      }
+      this._loadContent?.();
+    };
+  },
+});

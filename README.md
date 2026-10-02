@@ -23,9 +23,19 @@ selected file's text as a `STRING`.
 The STRING output carries a real type, so automation (e.g. ComfyUI-AutoFlow)
 can connect it by type.
 
+### Pad Audio
+
+Add silence to the start and/or end of an `AUDIO`, in seconds (float).
+
+- **audio**: the audio to pad.
+- **pad_start**: seconds of silence to prepend (default 0).
+- **pad_end**: seconds of silence to append (default 0).
+
+Silence is padded with zeros at the audio's own sample rate. `pad_start` and
+`pad_end` are independent; both 0 returns the input unchanged (no copy).
+
 ## Relationship to comfyui-kwnodes
 
-This is the successor to `comfyui-kwnodes`. The old `PromptFilePicker` lives on
-as `PromptFilePickerLegacy` in that pack (marked `DEPRECATED`) so existing
-workflows keep loading; migrate to this pack's `PromptFilePicker` for `.srt`
-support and the typed API.
+This is the successor to `comfyui-kwnodes`. The old `PromptFilePicker` has been
+removed from that pack entirely; use this pack's `PromptFilePicker` (adds
+`.srt` support + the typed API) and the rest of the typed nodes here.
